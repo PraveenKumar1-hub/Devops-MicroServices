@@ -1,0 +1,106 @@
+name: Production Microservice CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-microservice
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ==========================================
+  # JOB 1: Security Scan & Build Verification
+  # ==========================================
+  ci-pipeline:
+    name: Build, Lint & Security Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: src/package-lock.json
+
+      - name: Validate Dependencies
+        run: |
+          cd src
+          npm ci --dry-run
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Local Image for Security Scan
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+
+      # DevSecOps Gate: Vulnerability Scan
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+          format: 'table'
+          exit-code: '1' # Fails build on High/Critical vulnerabilities
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push Container Image to Registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ env.IMAGE_TAG }}
+            ${{ env.DOCKER_IMAGE }}:latest
+
+  # ==========================================
+  # JOB 2: Automated Zero-Downtime Deployment
+  # ==========================================
+  cd-pipeline:
+    name: Zero-Downtime Deploy to AWS EC2
+    needs: ci-pipeline
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Scripts
+        uses: actions/checkout@v4
+
+      - name: Deploy to Remote Target via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            mkdir -p ~/app/scripts
+            cat << 'EOF' > ~/app/scripts/deploy.sh
+            ${{ secrets.DEPLOY_SCRIPT_CONTENT }}
+            EOF
+            chmod +x ~/app/scripts/deploy.sh
+            export IMAGE_NAME="${{ env.DOCKER_IMAGE }}"
+            export IMAGE_TAG="${{ env.IMAGE_TAG }}"
+            bash ~/app/scripts/deploy.sh
